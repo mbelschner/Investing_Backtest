@@ -2,32 +2,29 @@
 # 02_preise_yahoo.R  --  Preisdaten von Yahoo Finance holen
 # =============================================================================
 #
-# WAS PASSIERT HIER?
-# Wir brauchen fuer rund 2.400 Ticker die komplette Tageshistorie seit 2019.
-# Naiv gemacht sind das zehntausende Requests und Yahoo sperrt dich aus.
+# WAS PASSIERT HIER?  Drei Schritte:
 #
-# Vier Regeln, damit das nicht passiert:
+#   1. ZUORDNUNG RIC -> Yahoo-Ticker, per ISIN-Suche bei Yahoo. Ergebnis
+#      landet in data/raw/ticker_map.csv und wird nur einmal gesucht.
+#      Falsche Treffer kannst du dort von Hand korrigieren (quelle = "manuell").
 #
-#   1. EIN Request pro Ticker fuer die GESAMTE Historie.
-#      Der Chart-Endpunkt liefert 7 Jahre Tagesdaten in einem Aufruf.
-#      Nicht pro Jahr oder pro Monat schleifen.
+#   2. DOWNLOAD mit Cache: ein Request je Ticker fuer die ganze Historie,
+#      eine .rds je Ticker in data/cache/. Pause zwischen den Requests,
+#      bei 429 ("zu viele Anfragen") bremst der Downloader sich selbst.
+#      Symbole, die Yahoo nicht kennt, werden nicht jedes Mal neu probiert.
 #
-#   2. CACHE auf der Platte. Jeder Ticker landet als .rds in data/cache/.
-#      Beim zweiten Lauf wird nur geholt, was fehlt. Ein abgebrochener Lauf
-#      kostet nichts -- einfach neu starten, er macht dort weiter.
+#   3. PRUEFUNG jeder Reihe, bevor sie ins Panel darf:
+#      - Waehrung passt nicht zum Markt  -> anderes Wertpapier, raus
+#      - delisteter Titel, dessen Reihe erst NACH dem Delisting beginnt oder
+#        lange danach weiterlaeuft -> Yahoo hat das Kuerzel neu vergeben
+#        (INFO war IHS Markit, ist heute eine andere Firma), raus
+#      - delistete Titel werden am Delisting-Datum abgeschnitten.
 #
-#   3. PAUSE zwischen den Requests (Default 0,35 s = ca. 3 Requests/Sekunde)
-#      und automatisches Hochfahren der Pause, sobald Yahoo mit 429
-#      ("Too Many Requests") antwortet. Der Downloader bremst sich selbst.
-#
-#   4. TOTE TICKER MERKEN. Ein delistetes Papier, das Yahoo nicht kennt,
-#      wird einmal probiert und dann in der Statusdatei als "hoffnungslos"
-#      vermerkt. Nicht bei jedem Lauf 200 mal ins Leere greifen.
-#
-# Laufzeit erster Durchlauf: ca. 15-20 Minuten fuer 2.400 Ticker.
-# Jeder weitere Lauf: wenige Minuten.
+# Offline arbeiten (nur Cache, kein Netz): CFG$yh_offline <- TRUE
 #
 # Ergebnis: data/proc/prices.rds  (long-Format: id, date, ohlcv, adjclose)
+#           data/proc/universe.rds (Spalte yahoo aktualisiert)
+#           output/price_check.csv (welche Reihe warum verworfen wurde)
 # =============================================================================
 
 source("00_config.R")
@@ -161,7 +158,12 @@ yh_fetch_one <- function(symbol, from = CFG$date_start, to = CFG$date_end) {
     
     # Waehrung als echte Spalte mitschreiben. Brauchen wir spaeter, um den
     # Tagesumsatz in USD umzurechnen (Liquiditaetsfilter).
-    dt[, currency := toupper(r$meta$currency %||% NA_character_)]
+    # Vorsicht: London notiert in PENCE, Yahoo schreibt dann "GBp". Ein
+    # toupper() machte daraus "GBP" -- und der Umsatz war 100-fach zu hoch.
+    # Pence heissen bei uns "GBX".
+    cur <- r$meta$currency %||% NA_character_
+    dt[, currency := if (identical(cur, "GBp")) "GBX" else toupper(cur)]
+    dt[, ccy_src := cur]
     return(list(ok = TRUE, data = dt, status = "ok"))
   }
   
@@ -206,6 +208,10 @@ fetch_prices <- function(symbols, force = FALSE, max_new = Inf) {
   
   symbols <- unique(symbols[!is.na(symbols) & nzchar(symbols)])
   stt <- load_status()
+  if (isTRUE(CFG$yh_offline)) {
+    msg("Offline-Modus: kein Download, es wird nur der Cache benutzt.")
+    return(invisible(stt))
+  }
   setkey(stt, yahoo)
   yh_prime()
   
@@ -307,72 +313,189 @@ fetch_prices <- function(symbols, force = FALSE, max_new = Inf) {
   invisible(stt)
 }
 
+
 # =============================================================================
-# 4. CACHE ZU EINEM PANEL ZUSAMMENBAUEN
+# 4. ZUORDNUNG RIC -> YAHOO PER ISIN
+# =============================================================================
+# Die Faustregel ric_to_yahoo() aus 00 trifft nur die Boersen-Endung sicher.
+# Yahoos Suchfeld kennt aber die ISIN. Wir fragen je ISIN einmal nach und
+# nehmen den Treffer, dessen Endung zur Boerse des RIC passt (BASFn.DE ->
+# Endung ".DE" -> BAS.DE). Ohne passenden Treffer bleibt die Faustregel.
+
+yh_search_isin <- function(isin) {
+  resp <- tryCatch(
+    request("https://query2.finance.yahoo.com/v1/finance/search") |>
+      req_url_query(q = isin, quotesCount = 10, newsCount = 0) |>
+      req_headers(`User-Agent` = CFG$yh_user_agent) |>
+      req_timeout(20) |>
+      req_error(is_error = function(resp) FALSE) |>
+      req_perform(),
+    error = function(e) NULL)
+  if (is.null(resp) || resp_status(resp) != 200L) return(character(0))
+  js <- tryCatch(fromJSON(resp_body_string(resp), simplifyVector = FALSE),
+                 error = function(e) NULL)
+  q <- js$quotes
+  if (!length(q)) return(character(0))
+  sym  <- vapply(q, function(e) e$symbol    %||% NA_character_, "")
+  type <- vapply(q, function(e) e$quoteType %||% NA_character_, "")
+  sym[type %in% "EQUITY" & !is.na(sym)]
+}
+
+#' Den Kandidaten waehlen, dessen Endung zur Faustregel passt
+pick_symbol <- function(cands, rule) {
+  if (!length(cands) || is.na(rule)) return(NA_character_)
+  suffix <- if (grepl("\\.", rule)) sub("^.*(\\.[^.]+)$", "\\1", rule) else ""
+  ok <- if (nzchar(suffix)) endsWith(cands, suffix) else !grepl("\\.", cands)
+  if (any(ok)) cands[ok][1] else NA_character_
+}
+
+map_path <- function() file.path(CFG$dir_raw, "ticker_map.csv")
+
+#' ticker_map.csv laden und um neue RICs ergaenzen
+#'
+#' Spalten: id (RIC), isin, yahoo, quelle ("isin", "regel" oder "manuell").
+#' Bereits vorhandene Zeilen werden nie neu gesucht -- wer korrigieren will,
+#' traegt den richtigen Ticker ein und setzt quelle auf "manuell".
+build_ticker_map <- function(universe) {
+  map <- if (file.exists(map_path()))
+    fread(map_path(), colClasses = "character") else
+    data.table(id = character(), isin = character(),
+               yahoo = character(), quelle = character())
+
+  neu <- universe[!id %in% map$id, .(id, isin, rule = yahoo)]
+  if (nrow(neu) && isTRUE(CFG$yh_offline)) {
+    msg("Offline: ", nrow(neu), " RICs ohne Zuordnung, nehme die Faustregel ",
+        "(werden beim naechsten Online-Lauf gesucht).")
+    return(rbind(map, neu[, .(id, isin, yahoo = rule, quelle = "regel")]))
+  }
+  if (nrow(neu)) {
+    msg("ISIN-Suche fuer ", nrow(neu), " RICs ...")
+    yh_prime()
+    pb <- txtProgressBar(min = 0, max = nrow(neu), style = 3)
+    for (i in seq_len(nrow(neu))) {
+      hit <- NA_character_
+      if (!is.na(neu$isin[i]) && nzchar(neu$isin[i])) {
+        hit <- pick_symbol(yh_search_isin(neu$isin[i]), neu$rule[i])
+        Sys.sleep(.yh_session$sleep)
+      }
+      map <- rbind(map, data.table(
+        id = neu$id[i], isin = neu$isin[i],
+        yahoo  = if (is.na(hit)) neu$rule[i] else hit,
+        quelle = if (is.na(hit)) "regel" else "isin"))
+      if (i %% 50L == 0L) fwrite(map, map_path())
+      setTxtProgressBar(pb, i)
+    }
+    close(pb)
+    fwrite(map, map_path())
+  }
+  msg("Ticker-Zuordnung: ", paste(names(table(map$quelle)), table(map$quelle),
+                                  sep = " = ", collapse = " | "))
+  map[]
+}
+
+# =============================================================================
+# 5. CACHE ZU EINEM PANEL ZUSAMMENBAUEN UND PRUEFEN
 # =============================================================================
 
 #' Alle .rds-Dateien aus dem Cache zu einer langen Tabelle verbinden
 #'
 #' @param map data.table mit Spalten id (RIC) und yahoo (Yahoo-Ticker)
 assemble_prices <- function(map) {
-  
+
   map <- unique(map[!is.na(yahoo), .(id, yahoo)], by = "id")
   files <- cache_path(map$yahoo)
   keep  <- file.exists(files)
   msg("Panel bauen aus ", sum(keep), " von ", nrow(map), " Cache-Dateien.")
-  
-  lst <- vector("list", sum(keep))
-  ids <- map$id[keep]
-  fl  <- files[keep]
-  
-  for (k in seq_along(fl)) {
-    x <- tryCatch(readRDS(fl[k]), error = function(e) NULL)
-    if (is.null(x) || nrow(x) == 0) next
-    x[, id := ids[k]]
-    lst[[k]] <- x
-  }
-  
+
+  lst <- lapply(which(keep), function(k) {
+    x <- tryCatch(readRDS(files[k]), error = function(e) NULL)
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    # Altbestand im Cache: dort steht fuer London "GBP", obwohl die Kurse in
+    # Pence sind (siehe yh_fetch_one). Neue Dateien tragen ccy_src.
+    if (!"ccy_src" %in% names(x) && endsWith(map$yahoo[k], ".L") &&
+        identical(x$currency[1], "GBP"))
+      x[, currency := "GBX"]
+    if ("ccy_src" %in% names(x)) x[, ccy_src := NULL]
+    x[, id := map$id[k]]
+  })
+
   p <- rbindlist(lst, use.names = TRUE, fill = TRUE)
-  p <- p[!is.na(id)]
   setcolorder(p, c("id", "date"))
   setorder(p, id, date)
-  p <- unique(p, by = c("id", "date"))
-  
-  msg("Preis-Panel: ", format(nrow(p), big.mark = "."), " Zeilen, ",
-      uniqueN(p$id), " Ticker, ",
-      format(min(p$date)), " bis ", format(max(p$date)))
+  unique(p, by = c("id", "date"))
+}
+
+#' Reihen verwerfen, die nicht zum RIC gehoeren koennen
+#'
+#' Gibt das bereinigte Panel zurueck und schreibt output/price_check.csv.
+check_prices <- function(p, universe) {
+  chk <- p[, .(currency = currency[1], first_px = min(date),
+               last_px = max(date)), by = id]
+  chk <- merge(universe[, .(id, name, market, yahoo, delist_date)], chk,
+               by = "id", all.x = TRUE)
+  chk[, ccy_erwartet := unname(MARKET_CCY[market])]
+  chk[, grund := fcase(
+    is.na(first_px), "keine Kurse",
+    !is.na(ccy_erwartet) & currency != ccy_erwartet, "Waehrung passt nicht",
+    !is.na(delist_date) & first_px > delist_date, "Kuerzel neu vergeben",
+    !is.na(delist_date) & last_px > delist_date + 60, "laeuft nach Delisting weiter",
+    default = "ok")]
+
+  msg("--- Pruefung der Kursreihen ---")
+  print(chk[, .N, by = grund][order(-N)])
+  bad <- chk[!grund %in% c("ok", "keine Kurse")]
+  if (nrow(bad))
+    print(bad[, .(id, yahoo, name, market, currency, first_px, last_px,
+                  delist_date, grund)])
+  fwrite(chk, file.path(CFG$dir_out, "price_check.csv"))
+
+  p <- p[id %in% chk[grund == "ok", id]]
+  # Tote Titel am Delisting-Datum abschneiden: was danach kommt, gehoert
+  # nicht mehr zu diesem Unternehmen.
+  p <- merge(p, universe[, .(id, delist_date)], by = "id", all.x = TRUE)
+  p <- p[is.na(delist_date) | date <= delist_date]
+  p[, delist_date := NULL]
+  setorder(p, id, date)
+
+  # Der Survivorship-Check: wie viele der delisteten Titel haben Kurse?
+  tot <- chk[!is.na(delist_date)]
+  msg("Delistete Titel mit brauchbaren Kursen: ", tot[grund == "ok", .N],
+      " von ", nrow(tot), ". Der Rest fehlt im Panel -- das ist die ",
+      "Groesse des verbleibenden Survivorship-Problems.")
+  msg("Preis-Panel: ", format(nrow(p), big.mark = ".", decimal.mark = ","), " Zeilen, ",
+      uniqueN(p$id), " Ticker, ", format(min(p$date)), " bis ",
+      format(max(p$date)))
   p[]
 }
 
 # =============================================================================
-# 5. WECHSELKURSE  (frueher in 03_universum_pit.R)
+# 6. WECHSELKURSE
 # =============================================================================
-# Volumen mal Kurs ergibt den Tagesumsatz in LOKALER Waehrung. 5 Mio KRW sind
-# aber keine 5 Mio USD. Fuer die Liquiditaetsdezile in der Diagnose brauchen
-# wir eine gemeinsame Waehrung, also holen wir eine Handvoll FX-Reihen mit.
-# Das sind ~15 zusaetzliche Requests.
+# Volumen mal Kurs ergibt den Tagesumsatz in LOKALER Waehrung. Fuer die
+# Liquiditaetsdezile brauchen wir eine gemeinsame Waehrung (USD).
 
 fetch_fx <- function(currencies) {
-  currencies <- setdiff(unique(toupper(currencies[!is.na(currencies)])), "USD")
+  currencies <- setdiff(unique(toupper(currencies[!is.na(currencies)])),
+                        c("USD", "GBX"))
   msg("FX holen fuer: ", paste(currencies, collapse = ", "))
-
-  out <- vector("list", length(currencies))
-  for (k in seq_along(currencies)) {
-    cur <- currencies[k]
+  out <- lapply(currencies, function(cur) {
     sym <- paste0(cur, "USD=X")   # KRWUSD=X = wie viel USD kostet 1 KRW
     r <- yh_fetch_one(sym, CFG$date_start, CFG$date_end)
     Sys.sleep(.yh_session$sleep)
-    if (r$ok) out[[k]] <- data.table(currency = cur, date = r$data$date,
-                                     fx_usd = r$data$close)
-    else msg("  FX fehlgeschlagen: ", sym, " (", r$status, ")")
-  }
+    if (!r$ok) { msg("  FX fehlgeschlagen: ", sym, " (", r$status, ")"); return(NULL) }
+    data.table(currency = cur, date = r$data$date, fx_usd = r$data$close)
+  })
   fx <- rbindlist(out)
-  if (nrow(fx)) {
-    d <- sort(unique(fx$date))
-    fx <- rbind(fx, data.table(currency = "USD", date = d, fx_usd = 1))
-  }
+  fx <- rbind(fx, data.table(currency = "USD", date = sort(unique(fx$date)),
+                             fx_usd = 1))
   setorder(fx, currency, date)
   fx[]
+}
+
+# Pence = Pfund / 100
+add_gbx <- function(fx) {
+  if ("GBX" %in% fx$currency || !"GBP" %in% fx$currency) return(fx)
+  rbind(fx, fx[currency == "GBP"][, `:=`(currency = "GBX", fx_usd = fx_usd / 100)])
 }
 
 # =============================================================================
@@ -383,123 +506,30 @@ if (run_main()) {
 
   universe <- readRDS(file.path(CFG$dir_proc, "universe.rds"))
 
-  # Zum Testen erst mal klein anfangen:
-  #   fetch_prices(universe$yahoo, max_new = 100)
+  # 1. Zuordnung
+  map <- build_ticker_map(universe)
+  universe[map, on = "id", yahoo := i.yahoo]
+  saveRDS(universe, file.path(CFG$dir_proc, "universe.rds"))
+
+  # 2. Download (zum Testen erst mal klein: fetch_prices(..., max_new = 100))
   fetch_prices(universe$yahoo)
 
-  # Panel nur neu bauen, wenn sich im Cache etwas getan hat.
-  prices_file <- file.path(CFG$dir_proc, "prices.rds")
-  cache_files <- list.files(CFG$dir_cache, pattern = "\\.rds$", full.names = TRUE)
-  newest_cache <- if (length(cache_files)) max(file.mtime(cache_files)) else as.POSIXct(NA)
+  # 3. Panel bauen und pruefen
+  prices <- check_prices(assemble_prices(universe[, .(id, yahoo)]), universe)
+  saveRDS(prices, file.path(CFG$dir_proc, "prices.rds"))
 
-  if (file.exists(prices_file) && !is.na(newest_cache) &&
-      file.mtime(prices_file) > newest_cache) {
-    msg("prices.rds ist aktueller als der Cache -- wird wiederverwendet.")
-    prices <- readRDS(prices_file)
-  } else {
-    prices <- assemble_prices(universe[, .(id, yahoo)])
-    saveRDS(prices, prices_file)
-  }
-
-  # --- FX ---------------------------------------------------------------
+  # 4. Wechselkurse
   fx_file <- file.path(CFG$dir_proc, "fx.rds")
-  if (file.exists(fx_file)) {
-    fx <- readRDS(fx_file)
-    msg("FX aus Cache: ", uniqueN(fx$currency), " Waehrungen.")
-  } else {
-    fx <- fetch_fx(unique(prices$currency))
-    saveRDS(fx, fx_file)
-  }
+  fx <- if (file.exists(fx_file)) readRDS(fx_file) else fetch_fx(prices$currency)
+  saveRDS(add_gbx(fx), fx_file)
 
-  # ===========================================================================
-  # ABDECKUNGSPRUEFUNG: haben wir fuer jedes EREIGNIS auch Kurse?
-  # ===========================================================================
-  # Das ist der Check, der frueher gefehlt hat. Ein Ticker "hat Kurse" reicht
-  # nicht -- entscheidend ist, ob rund um JEDEN Berichtstermin genug Handels-
-  # tage vorliegen. Ohne Vorlauf keine Vor-Ereignis-Volatilitaet, ohne
-  # Nachlauf kein CAR60. Fehlt beides systematisch bei denselben Titeln,
-  # verlierst du nicht zufaellig Daten, sondern ein ganzes Marktsegment.
-
-  fund_file <- file.path(CFG$dir_proc, "fundamentals.rds")
-  if (!file.exists(fund_file)) {
-    msg("Hinweis: fundamentals.rds fehlt -- erst 01_parameter.R laufen lassen, ",
-        "dann ist hier auch die Ereignis-Abdeckung zu sehen.")
-  } else {
-
-    fund <- readRDS(fund_file)
-    setDT(prices)
-
-    # a) Ticker-Ebene
-    cov_id <- prices[, .(n_px = .N, first_px = min(date), last_px = max(date)),
-                     by = id]
-    cov_id <- merge(universe[, .(id, name, market, yahoo, delist_date)],
-                    cov_id, by = "id", all.x = TRUE)
-    cov_id[, hat_kurse := !is.na(n_px)]
-    cov_id[, hat_events := id %in% fund[!is.na(report_date), unique(id)]]
-
-    msg("--- Abdeckung Ticker-Ebene ---")
-    print(cov_id[, .N, by = .(hat_events, hat_kurse)][order(-N)])
-
-    fehlt <- cov_id[hat_events == TRUE & hat_kurse == FALSE]
-    msg("Ticker mit Quartalsberichten, aber OHNE Kurse: ", nrow(fehlt))
-    if (nrow(fehlt)) print(head(fehlt[order(market), .(id, yahoo, name, market)], 20))
-    msg("  -> Haeufigste Ursache: RIC-zu-Yahoo-Uebersetzung. Pruefe die ",
-        "Boersenkuerzel oben in RIC_EXCHANGE_MAP.")
-
-    # b) Ereignis-Ebene: Handelstage vor und nach jedem Berichtstermin.
-    # Wir zaehlen HANDELSTAGE, nicht Kalendertage -- fuer ein Ereignisfenster
-    # von 60 Boersentagen ist nur die Zahl der tatsaechlichen Kurse relevant.
-    ev <- fund[!is.na(report_date), .(id, period_end, report_date)]
-
-    px_ct <- prices[, .(id, date)]
-    setorder(px_ct, id, date)
-    px_ct[, t_idx := seq_len(.N), by = id]
-    px_ct[, n_id  := .N, by = id]
-    setkey(px_ct, id, date)
-
-    # roll = -Inf sucht vorwaerts: der erste Handelstag AM oder NACH dem
-    # Berichtstermin. Genau der ist spaeter Ereignistag 0.
-    hit <- px_ct[ev[, .(id, date = report_date)], on = .(id, date), roll = -Inf]
-    ev[, t0     := hit$t_idx]
-    ev[, n_ges  := hit$n_id]
-    ev[, hat_kurse := !is.na(t0)]
-    ev[, n_pre  := t0 - 1L]          # Handelstage vor dem Ereignis
-    ev[, n_post := n_ges - t0]       # Handelstage danach
-
-    ev[, ok_event := hat_kurse & !is.na(n_pre) & n_pre >= 60 &
-                     !is.na(n_post) & n_post >= 60]
-
-    msg("--- Abdeckung Ereignis-Ebene ---")
-    msg("Berichtstermine gesamt          : ", nrow(ev))
-    msg("davon mit Kursreihe             : ", sum(ev$hat_kurse))
-    msg("davon mit >=60 Handelstagen davor: ", sum(ev$n_pre >= 60, na.rm = TRUE))
-    msg("davon mit >=60 Handelstagen danach: ", sum(ev$n_post >= 60, na.rm = TRUE))
-    msg("VOLL AUSWERTBAR                 : ", sum(ev$ok_event), " (",
-        round(100 * mean(ev$ok_event), 1), "%)")
-
-    # Wo genau verlieren wir die Ereignisse? Nach Markt aufschluesseln --
-    # wenn ein Land komplett fehlt, ist es ein Uebersetzungsproblem und
-    # keine Datenluecke.
-    ev2 <- merge(ev, universe[, .(id, market)], by = "id", all.x = TRUE)
-    print(ev2[, .(events = .N,
-                  pct_mit_kurs = round(100 * mean(hat_kurse), 1),
-                  pct_auswertbar = round(100 * mean(ok_event), 1)),
-              by = market][order(pct_auswertbar)])
-
-    # Und ueber die Zeit: am aktuellen Rand fehlt der Nachlauf zwangslaeufig.
-    # Das ist normal. Wenn die Quote aber in der MITTE der Historie einbricht,
-    # stimmt etwas nicht.
-    ev2[, jahr := as.integer(format(report_date, "%Y"))]
-    print(ev2[, .(events = .N, pct_auswertbar = round(100 * mean(ok_event), 1)),
-              by = jahr][order(jahr)])
-
-    fwrite(ev2[, .(id, market, period_end, report_date, hat_kurse,
-                   n_pre, n_post, ok_event)],
-           file.path(CFG$dir_out, "price_coverage.csv"))
-    msg("Detailtabelle: output/price_coverage.csv")
-  }
-
-  # --- Downloadstatus ---------------------------------------------------
-  stt <- load_status()
-  print(stt[, .N, by = status][order(-N)])
+  # 5. Abdeckung je Markt: fehlt ein Land fast komplett, ist es ein
+  #    Zuordnungsproblem und keine Datenluecke.
+  cov <- universe[, .(ticker = .N,
+                      mit_kursen = sum(id %in% prices$id),
+                      davon_delistet = sum(!is.na(delist_date)),
+                      delistet_mit_kursen = sum(!is.na(delist_date) & id %in% prices$id)),
+                  by = market][order(-ticker)]
+  print(cov)
+  print(load_status()[, .N, by = status][order(-N)])
 }

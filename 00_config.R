@@ -4,8 +4,8 @@
 #
 # WAS PASSIERT HIER?
 # Alles, was mehrere Skripte gemeinsam brauchen, steht an EINER Stelle:
-# Pfade, Pakete, Strategie-Parameter und zwei kleine "Uebersetzer":
-#   - RIC  -> Yahoo-Ticker   (005930.KS -> 005930.KS, BRKb.N -> BRK-B, ...)
+# Pfade, Pakete, Parameter der Ereignisstudie und zwei kleine "Uebersetzer":
+#   - RIC  -> Yahoo-Ticker   (Faustregel; 02 ersetzt sie per ISIN-Suche)
 #   - RIC  -> Delisting-Datum (.N^J22 -> 31.10.2022)
 #
 # Diese Datei wird von allen anderen Skripten oben mit source() geladen.
@@ -24,8 +24,8 @@ setDTthreads(0)  # 0 = alle verfuegbaren Kerne nutzen
 # 1. Pfade
 # -----------------------------------------------------------------------------
 # Erwartete Ordnerstruktur:
-#   pead/
-#     data/raw/      <- hier die CSV-Exporte aus Excel ablegen
+#   Investing_Backtest/
+#     data/raw/      <- LSEG-Excel (oder CSV-Exporte) + ticker_map.csv
 #     data/cache/    <- Yahoo-Preise, ein .rds je Ticker (wird angelegt)
 #     data/proc/     <- fertig gerechnete Panels (wird angelegt)
 #     output/        <- Backtest-Ergebnisse (wird angelegt)
@@ -68,36 +68,25 @@ CFG$sheet_skip <- 3
 CFG$date_start <- as.Date("2019-07-01")   # Beginn der LSEG-Historie
 CFG$date_end   <- Sys.Date()
 
-# Der Backtest startet spaeter als die Daten, weil wir Vorlauf brauchen:
-# 4 Quartale fuer TTM + 252 Tage fuer 12M-Momentum.
-CFG$date_bt_start <- as.Date("2021-01-01")
-
 # -----------------------------------------------------------------------------
-# 3. Strategie-Parameter
+# 3. Parameter der Ereignisstudie
 # -----------------------------------------------------------------------------
-# Haltedauer: du willst mindestens 90 Tage halten. PEAD ist genau darauf
-# ausgelegt -- der Drift laeuft klassisch ueber ein Quartal nach dem Bericht.
-CFG$hold_days     <- 90     # Kalendertage
-CFG$entry_lag     <- 1      # Handelstage NACH dem Report-Datum einsteigen.
-# 0 waere Lookahead: der Bericht kommt oft nach
-# Handelsschluss oder vorboerslich.
-CFG$rebal_weekday <- 1      # 1 = Montag. Events werden wochenweise gebuendelt.
+# Haltedauer: Compliance verlangt mindestens 90 Tage. Gemessen wird deshalb
+# genau so, wie du handeln wuerdest: Einstieg zum Schlusskurs an Tag
+# entry_lag nach dem Bericht, Ausstieg am ersten Handelstag, der mindestens
+# hold_days KALENDERtage spaeter liegt.
+CFG$hold_days <- 90     # Kalendertage
+CFG$entry_lag <- 1      # Handelstage NACH dem Bericht bis zum Einstieg.
+                        # 0 waere Lookahead: der Bericht kommt oft nach
+                        # Handelsschluss oder vorboerslich.
 
-# Hygiene
-CFG$min_mktcap    <- 1e9    # 1 Mrd USD
-CFG$min_adv_usd   <- 5e6    # 5 Mio USD Tagesumsatz, rollierend selbst gerechnet
-CFG$max_growth    <- 3.0    # Wachstum ueber +300% = Sondereffekt, raus
-CFG$sector_cap    <- 0.30   # max. 30% des Portfolios je TRBC-Industry
-CFG$max_stale_days<- 200    # Fundamentaldaten aelter als 200 Tage = unbrauchbar
+# Raenge (SUE-Quintil, Liquiditaetsdezil) werden NUR gegen Berichte gebildet,
+# die zum Einstieg schon bekannt waren: die der letzten rank_window_days Tage.
+CFG$rank_window_days <- 90
+CFG$rank_min_n       <- 50   # weniger Vergleichsberichte -> kein Rang
 
-# Kosten (pro Seite, in Basispunkten). Dein Universum ist gemischt:
-# US/DE guenstig, KR/TW/HK teurer (Stempelsteuer, Spread).
-CFG$cost_bps      <- 25
-
-# Delisting-Rendite: was passiert mit einer offenen Position, wenn der Titel
-# verschwindet? Shumway (1997) findet fuer NYSE/AMEX rund -30%, fuer Nasdaq
-# rund -55%. Wir nehmen -30% als Default und testen die Sensitivitaet.
-CFG$delist_return <- -0.30
+# Gebuehren pro Seite in Basispunkten (der Spread wird separat geschaetzt).
+CFG$cost_bps <- 25
 
 # Wenn kein report_date vorliegt: konservativer Melde-Lag in Kalendertagen.
 CFG$report_lag_fallback <- 75
@@ -108,25 +97,17 @@ CFG$report_lag_fallback <- 75
 # Fuer den ersten Durchlauf: nur eine Handvoll Ticker statt aller 2.365.
 # Der Preis-Cache ist pro Ticker, also ist nichts verloren -- was du im Test
 # heruntergeladen hast, wird beim spaeteren Volllauf wiederverwendet.
-#
-# Diese drei Werte werden von run_all.R ueberschrieben, falls du sie dort
-# setzt. Wenn du ein Skript einzeln laufen laesst, gelten die Werte hier.
 CFG$test_mode <- FALSE   # TRUE = nur eine Stichprobe rechnen
 CFG$test_n    <- 120     # wie viele Ticker
 CFG$test_ids  <- NULL    # oder konkrete RICs, z.B. c("005930.KS", "2330.TW")
-
-# Ehrliche Anzahl der Versuche fuer die Deflated Sharpe Ratio.
-# Vier Varianten sind der Startwert. Jede weitere Parameterrunde, jeder
-# verworfene Filter, jedes "probier mal 60 statt 90 Tage" erhoeht diese Zahl.
-# Fuehr Buch darueber und trag den echten Wert ein -- sonst rechnest du dir
-# die Signifikanz schoen.
-CFG$n_trials <- 4
 
 # -----------------------------------------------------------------------------
 # 4. Yahoo-Downloader
 # -----------------------------------------------------------------------------
 CFG$yh_sleep        <- 0.35  # Sekunden Pause zwischen zwei Requests
 CFG$yh_max_retry    <- 4     # Wiederholungen bei Fehler
+# TRUE = nichts herunterladen, nur aus dem vorhandenen Cache arbeiten.
+CFG$yh_offline      <- FALSE
 # Wie alt darf der Cache eines LEBENDEN Titels werden, bevor die Historie
 # komplett neu geladen wird? Komplett deshalb, weil adjclose bei jeder
 # Dividende rueckwirkend fuer die ganze Vergangenheit neu skaliert wird --
@@ -151,6 +132,10 @@ CFG$yh_user_agent   <- paste(
 # Refinitiv und Yahoo benutzen unterschiedliche Boersenkuerzel.
 # Diese Tabelle uebersetzt die Endung. "" bedeutet: Yahoo braucht keine Endung
 # (gilt fuer alle US-Boersen).
+#
+# Verlaesslich ist nur die ENDUNG. Die Wurzel weicht vor allem in DE/FR/AT ab
+# (BASFn.DE ist bei Yahoo BAS.DE, SAPG.DE ist SAP.DE). Deshalb sucht 02 den
+# Yahoo-Ticker per ISIN und nimmt diese Regel nur als Rueckfallebene.
 RIC_EXCHANGE_MAP <- c(
   # USA -- Yahoo hat keinen Boersen-Suffix
   "N" = "", "OQ" = "", "O" = "", "A" = "", "P" = "", "Z" = "", "K" = "",
@@ -200,6 +185,19 @@ ric_to_yahoo <- function(ric) {
                 ifelse(is.na(suffix), NA_character_, paste0(root, suffix)))
   out
 }
+
+# Erwartete Handelswaehrung je Markt. Dient als Plausibilitaetscheck: liefert
+# Yahoo fuer eine britische Aktie eine Euro-Reihe, ist es ein anderes Papier
+# (so geschehen bei BAES.L). GBX = britische Pence, so notiert die LSE.
+MARKET_CCY <- c(
+  "United States" = "USD", "Hong Kong" = "HKD", "Japan" = "JPY",
+  "Korea" = "KRW", "Taiwan" = "TWD", "United Kingdom" = "GBX",
+  "Switzerland" = "CHF", "Sweden" = "SEK", "Denmark" = "DKK",
+  "Norway" = "NOK", "Poland" = "PLN",
+  "Germany" = "EUR", "France" = "EUR", "Austria" = "EUR", "Italy" = "EUR",
+  "Netherlands" = "EUR", "Spain" = "EUR", "Finland" = "EUR",
+  "Belgium" = "EUR", "Ireland" = "EUR", "Portugal" = "EUR"
+)
 
 # -----------------------------------------------------------------------------
 # 6. Uebersetzer: RIC -> Delisting-Datum
@@ -307,37 +305,6 @@ safe_div <- function(a, b) {
   a / b2
 }
 
-# Winsorisieren: Extremwerte auf Quantile kappen. Verhindert, dass ein
-# einzelner Ausreisser eine Rangliste oder Regression dominiert.
-winsorize <- function(x, p = 0.01) {
-  q <- quantile(x, c(p, 1 - p), na.rm = TRUE)
-  pmin(pmax(x, q[1]), q[2])
-}
-
-# Cross-sectional z-Score (robust: winsorisiert vor der Standardisierung)
-zscore <- function(x, p = 0.01) {
-  x <- winsorize(x, p)
-  s <- sd(x, na.rm = TRUE)
-  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
-  (x - mean(x, na.rm = TRUE)) / s
-}
-
-# Perzentilrang von 0 bis 1. Kleiner Wert = niedriger Rang.
-# frank() aus data.table behandelt NA korrekt (na.last = "keep").
-prank <- function(x) {
-  n <- sum(!is.na(x))
-  if (n == 0L) return(rep(NA_real_, length(x)))
-  data.table::frank(x, na.last = "keep", ties.method = "average") / n
-}
-
-# Naechster Handelstag >= d aus einem Kalendervektor
-next_trading_day <- function(d, calendar) {
-  # findInterval braucht echte Zahlen, deshalb as.numeric() auf beiden Seiten.
-  idx <- findInterval(as.numeric(d) - 1e-9, as.numeric(calendar)) + 1L
-  idx[idx < 1L | idx > length(calendar)] <- NA_integer_
-  calendar[idx]
-}
-
 # Rollierende Fensterfunktionen brechen ab, wenn die Reihe kuerzer ist als das
 # Fenster. Diese Wrapper geben in dem Fall sauber NA zurueck.
 roll_sum <- function(x, n) {
@@ -359,5 +326,5 @@ run_main <- function() !isTRUE(getOption("pead.lib_only"))
 
 msg <- function(...) cat(format(Sys.time(), "[%H:%M:%S] "), ..., "\n", sep = "")
 
-msg("Config geladen. Backtest-Fenster: ",
-    format(CFG$date_bt_start), " bis ", format(CFG$date_end))
+msg("Config geladen. Daten von ", format(CFG$date_start), " bis ",
+    format(CFG$date_end), ", Haltedauer ", CFG$hold_days, " Tage.")
