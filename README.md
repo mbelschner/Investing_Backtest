@@ -1,83 +1,86 @@
-# PEAD-Pipeline — Kurzanleitung
+# PEAD-Ereignisstudie — Kurzanleitung
 
-Vier Skripte, in dieser Reihenfolge auszuführen. Jedes speichert sein Ergebnis
-als `.rds`, damit du bei einem Fehler nicht alles neu rechnen musst.
+**Frage:** Hat eine Gewinnüberraschung im Quartalsbericht Vorhersagekraft für
+die nächsten **90 Kalendertage** (Compliance-Haltedauer)?
 
-```
-00_config.R          Einstellungen + Hilfsfunktionen (wird von allen geladen)
-01_parameter.R       LSEG-Exporte einlesen, TTM, alle Kennzahlen
-02_preise_yahoo.R    Kursdaten holen (separat, mit Cache)
-03_universum_pit.R   Point-in-Time-Panel ohne Survivorship Bias
-04_backtest_pead.R   Backtest, 4 Varianten, DSR, Permutationstest
-```
+**Messung:** Einstieg zum Schlusskurs am ersten Handelstag nach dem Bericht,
+Ausstieg am ersten Handelstag ≥ 90 Kalendertage später. Gemessen wird die
+Rendite über dem gleichgewichteten Heimatmarkt (CAR90).
 
-## Ordner anlegen
+## Skripte, in dieser Reihenfolge
 
 ```
-pead/
-  00_config.R … 04_backtest_pead.R
-  data/raw/        <- hier die CSVs aus Excel ablegen
-  data/cache/      <- legt Skript 02 selbst an
-  data/proc/
-  output/
+00_config.R             Einstellungen + Hilfsfunktionen (wird von allen geladen)
+01_parameter.R          LSEG-Daten einlesen, Berichtsdatum, TTM, SUE & Kennzahlen
+02_preise_yahoo.R       Ticker per ISIN zuordnen, Kurse laden (Cache), Reihen prüfen
+03_events_car.R         Ereignispanel: je Bericht Signal + CAR90
+04_auswertung.R         Kern: CAR-Pfad, Spanne, Long-only, Standardfehler, Kosten
+05_diagnose_optional.R  Zusatzdiagnosen (Datenintegrität, fette Ränder, Autokorrelation …)
 ```
-
-Arbeitsverzeichnis in R auf `pead/` setzen (`setwd()`), dann:
 
 ```r
+setwd("Pfad/zu/Investing_Backtest")
 source("01_parameter.R")
 source("02_preise_yahoo.R")
-source("03_universum_pit.R")
-source("04_backtest_pead.R")
+source("03_events_car.R")
+source("04_auswertung.R")
 ```
 
-## CSV-Export aus dem Excel-File
+Jedes Skript speichert sein Ergebnis unter `data/proc/`, Grafiken landen in
+`output/auswertung/` bzw. `output/diagnose/`.
 
-Drei Dateien nach `data/raw/`:
+## Gegen Lookahead und Survivorship Bias
 
-| Datei | Quelle | Wichtig |
-|---|---|---|
-| `universe.csv` | Tab `01_Ticker` | Export **ab Zeile 4** (Kopfzeile `RIC | ISIN | Common Name | Market | Stichdatum`). Die Titelzeilen 1–2 müssen weg. |
-| `fundamentals_01.csv`, `_02.csv`, … | Tab `03_Fundamentals_Export` | Export **ab Zeile 4**. Mehrere Batches einfach als mehrere Dateien ablegen — Skript 01 sammelt alle mit dem Muster `fundamentals*.csv` ein. |
-| `estimates_01.csv`, … | Tab `03_Estimates_Export` | Analog, Muster `estimates*.csv`. |
+| Maßnahme | Wo |
+|---|---|
+| Zahlen gelten erst ab dem echten Berichtsdatum (`known_from`), Ereignisse ohne echtes Datum fliegen raus | 01, 03 |
+| Einstieg erst am Handelstag **nach** dem Bericht | `CFG$entry_lag` |
+| SUE-Normierung nur mit **vergangenen** Überraschungen | 01 |
+| Ränge/Quintile nur gegen Berichte der **letzten 90 Tage** | 03, `rank_trailing()` |
+| Universum zum Stichtag 30.06.2019, inkl. später delisteter Titel | Excel `01_Ticker` |
+| Verschwindet ein Titel während der Haltedauer, endet die Position zum **letzten verfügbaren Kurs** — das Ereignis bleibt drin | 03 |
+| Yahoo-Reihen, die nicht zum RIC passen (falsche Währung, Kürzel neu vergeben), werden verworfen | 02, `output/price_check.csv` |
 
-Speichern als **CSV UTF-8 (durch Trennzeichen getrennt)**. `fread()` erkennt
-Komma und Semikolon automatisch.
+**Bekannte Lücke:** Yahoo hat für die meisten delisteten Titel keine Kurse.
+`02` meldet, wie viele fehlen. Solange sie fehlen, ist das Ergebnis eher zu
+optimistisch.
 
-### Achtung: Spaltenreihenfolge Fundamentals
+## Ticker-Zuordnung (`data/raw/ticker_map.csv`)
 
-Skript 01 liest die Fundamentals **positionsbasiert** ein, weil die Kopfzeile in
-`03_Fundamentals_Export` nicht zur Werte-Reihenfolge passt:
+Refinitiv-RICs lassen sich nicht per Regel in Yahoo-Ticker übersetzen
+(`BASFn.DE` ist `BAS.DE`). `02` sucht deshalb einmalig je ISIN bei Yahoo und
+speichert das Ergebnis in `data/raw/ticker_map.csv`:
 
-```
-Kopfzeile sagt:   … diluted_shares, total_assets, mktcap_usd, industry, adv_3m
-Werte kommen als: … diluted_shares, mktcap_usd,   total_assets, industry, adv_3m
-```
+| id | isin | yahoo | quelle |
+|---|---|---|---|
+| BASFn.DE | DE000BASF111 | BAS.DE | isin |
 
-Spalte K ist die Marktkapitalisierung, Spalte L die Bilanzsumme. Wenn du die
-Excel-Kopfzeile irgendwann korrigierst, musst du `FUND_COLS` in Skript 01
-mit anpassen. Beim Einlesen läuft eine Plausibilitätsprüfung mit, die die
-Medianwerte in die Konsole schreibt.
+`quelle` ist `isin` (Treffer), `regel` (kein Treffer, Faustregel) oder
+`manuell`. Falsche Zuordnungen einfach von Hand korrigieren und `quelle` auf
+`manuell` setzen — vorhandene Zeilen werden nie neu gesucht. Danach die
+betroffenen Kurse holen: `02` erneut laufen lassen.
 
-## Wo du drehen willst
+Ohne Internet: `CFG$yh_offline <- TRUE` arbeitet nur mit dem Cache.
 
-Alles in `CFG` (Skript 00):
+## Wo du drehen kannst (`CFG` in 00)
 
 | Parameter | Default | Bedeutung |
 |---|---|---|
 | `hold_days` | 90 | Haltedauer in Kalendertagen |
 | `entry_lag` | 1 | Handelstage nach dem Bericht bis zum Einstieg |
-| `min_mktcap` / `min_adv_usd` | 1e9 / 5e6 | Hygienefilter |
-| `sector_cap` | 0.30 | max. Anteil je TRBC-Industry |
-| `cost_bps` | 25 | Transaktionskosten je Seite |
-| `delist_return` | −0.30 | Abschlag bei erzwungenem Ausstieg |
-| `n_trials` | 4 | **ehrliche** Zahl der Versuche für die DSR |
+| `rank_window_days` | 90 | Vergleichsfenster für Ränge |
+| `cost_bps` | 25 | Gebühren je Seite (Spread wird separat geschätzt) |
 
-## Laufzeiten (Richtwerte, 2.365 Ticker)
+Jede Änderung ist ein weiterer **Versuch**. Wer viele Varianten testet,
+findet zufällig eine, die gut aussieht — führ Buch darüber.
 
-| Schritt | Erster Lauf | Danach |
-|---|---|---|
-| 01 Parameter | < 1 min | < 1 min |
-| 02 Preise | 15–20 min | 2–5 min (Cache) |
-| 03 Panel | 3–5 min | 3–5 min |
-| 04 Backtest | 2 min + Permutationstest ~10 min | dito |
+## LSEG-Rohdaten
+
+`01` liest direkt `data/raw/*.xlsx` (Tabs `01_Ticker`,
+`03_Fundamentals_Export`, `03_Estimates_Export`) oder — falls vorhanden —
+CSV-Exporte mit den Mustern `universe*.csv`, `fundamentals*.csv`,
+`estimates*.csv`.
+
+Achtung: In `03_Fundamentals_Export` passt die Kopfzeile nicht zur
+Wertereihenfolge (Spalte K = Marktkapitalisierung, L = Bilanzsumme). `01`
+liest deshalb positionsbasiert (`FUND_COLS`).

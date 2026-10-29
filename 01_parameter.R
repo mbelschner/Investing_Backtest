@@ -35,11 +35,6 @@ source("00_config.R")
 SUE_MIN_HIST <- 6L   # Vorquartale mit gueltiger Surprise, noetig fuer sue
 HIT_MIN_HIST <- 3L   # dito fuer surp_hit_rate4 (Fenster ist nur 4 lang)
 
-# Testmodus aus run_all.R uebernehmen, falls dort gesetzt.
-if (exists("TEST_MODE")) CFG$test_mode <- isTRUE(TEST_MODE)
-if (exists("TEST_N"))    CFG$test_n    <- TEST_N
-if (exists("TEST_IDS"))  CFG$test_ids  <- TEST_IDS
-
 # =============================================================================
 # A) ROHDATEN EINLESEN
 # =============================================================================
